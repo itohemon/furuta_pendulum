@@ -23,8 +23,19 @@ float Kd_pendulum = 0.37;  // 振り子の振れを抑えるブレーキ
 float Kp_arm = 0.272;
 float Kd_arm = 0.0955;
 
+// 振り上げ(エネルギー制御)用のゲイン
+// アームをしゃくる強さ
+float K_energy = 0.0000010;
+
+// 制御状態(ステート)の定義
+// 0: 振り上げモード(スイングアップ)
+// 1: 倒立維持モード(バランス)
+int controlMode = 0;
+
 // 制御周期用
 unsigned long lastTime = 0;
+float lastPendulumAngle = 0;
+float pendulumVelocity = 0;
 float lastPendulumError = 0;
 float lastArmError = 0;
 
@@ -32,7 +43,6 @@ float targetAngle = 1.0;
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
-
   pinMode(pinBIn1, OUTPUT);
   pinMode(pinBIn2, OUTPUT);
   pinMode(pinBPWM, OUTPUT);
@@ -51,40 +61,86 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(encB_A), doEncoderA, CHANGE);
 
   lastTime = micros();
+
+  delay(3000);
 }
 
 void loop() {
-  // 1. MT6701から振り子の角度を読み込む
-  float pendulumAngle = getMT6701Angle();
-
-  // 2. 安全対策：真上(0度)から45度以上傾いたらモーターを緊急停止
-  if (abs(pendulumAngle) > 45.0) {
-    controlMotor(0);
-    return;
-  }
-
-  // 3. 微分用の時間(dt)を計算（秒単位）
+  // 微分用の時間(dt)を計算（秒単位）
   unsigned long currentTime = micros();
   float dt = (currentTime - lastTime) / 1000000.0;
   if (dt <= 0.0) dt = 0.001;  // ゼロ除算防止
   lastTime = currentTime;
 
-  // 4. 【振り子軸】のPD制御計算
-  float pendulumError = targetAngle - pendulumAngle;  // 目標は0度（真上）
-  float pendulumDerivative = (pendulumError - lastPendulumError) / dt;
-  lastPendulumError = pendulumError;
+  // 1. MT6701から振り子の角度を読み込む
+  float pendulumAngle = getMT6701Angle();
+  if (pendulumAngle == 999.0) return; // エラー対策
 
-  float outputPendulum = (pendulumError * Kp_pendulum) + (pendulumDerivative * Kd_pendulum);
+  // 振り子の角速度(度/秒)を計算
+  float rawVelocity = (pendulumAngle - lastPendulumAngle) / dt;
+  pendulumVelocity = (rawVelocity * 0.15) + (pendulumVelocity * 0.85);
+  lastPendulumAngle = pendulumAngle;
 
-  // 5. 【アーム軸】のPD制御計算（アームがどこまでも流れていかないようにする）
-  float armError = 0.0 - encoderCount;  // 目標はエンコーダカウント0(初期位置)
-  float armDerivative = (armError - lastArmError) / dt;
-  lastArmError = armError;
-  float outputArm = (armError * Kp_arm) + (armDerivative * Kd_arm);
+  float motorOutput = 0.0;
 
-  // 6. 2つの出力を合算してモータを駆動
-  float totalOutput = outputPendulum + outputArm;
-  controlMotor(totalOutput);
+  // ==========================================================================
+  // 2. ステートマシン(モード切替ロジック)
+  // ==========================================================================
+
+  // 振り子が真上(0度)から±20度以内のエリアにふわっと入ってきたら
+  if (abs(pendulumAngle) < 20.0) {
+    if (controlMode == 0) {
+      // 振り上げ中だった場合、ここから倒立維持モードにバトンタッチ
+      controlMode = 1;
+      // 過去のエラー履歴をリセットしてPIDの急激な変化を防ぐ
+      lastPendulumError = targetAngle - pendulumAngle;
+      lastArmError = 0.0 - encoderCount;
+    }
+  } else if (abs(pendulumAngle) > 40.0) {
+    // 真上から40度以上脱落したら、諦めて振り上げモード(スイングアップ)に戻る
+    controlMode = 0;
+  }
+
+  // ==========================================================================
+  // 3. 各モードの制御計算
+  // ==========================================================================
+  if (controlMode == 1) {
+    // --- モード1: 倒立維持(これまでのPD制御) ---
+    digitalWrite(LED_PIN, LOW); // モード識別用(LED消灯 = 倒立維持)
+
+    float pendulumError = targetAngle - pendulumAngle;  // 目標は0度（真上）
+    float pendulumDerivative = (pendulumError - lastPendulumError) / dt;
+    lastPendulumError = pendulumError;
+    float outputPendulum = (pendulumError * Kp_pendulum) + (pendulumDerivative * Kd_pendulum);
+
+    // 【アーム軸】のPD制御計算（アームがどこまでも流れていかないようにする）
+    float armError = 0.0 - encoderCount;  // 目標はエンコーダカウント0(初期位置)
+    float armDerivative = (armError - lastArmError) / dt;
+    lastArmError = armError;
+    float outputArm = (armError * Kp_arm) + (armDerivative * Kd_arm);
+
+    motorOutput = outputPendulum + outputArm;
+
+  } else {
+    // --- モード0: 振り上げ(エネルギー制御) ---
+    digitalWrite(LED_PIN, HIGH); // モード識別用(LED点灯 = 振り上げ中)
+
+    // 振り子の現在の簡易エネルギー計算(位置＋運動)
+    float theta_rad = pendulumAngle * DEG_TO_RAD;
+    float E = 0.5 * pendulumVelocity * pendulumVelocity;
+    float E0 = 1000.0; // 真上で静止するときの目標エネルギー定数
+
+    // コトノピック法によるアームの加速度指令の計算
+    // 振り子の動く向き(pendulumVelocity)とエネルギーの過不足(E - E0)から出力を決定
+    motorOutput = K_energy * (E - E0) * pendulumVelocity;
+
+    // 安全対策: アームが回りすぎないよう、橋に行きそうになったら逆側に少し戻すブレーキ
+    if (encoderCount >  400 && motorOutput > 0) motorOutput = -50;
+    if (encoderCount < -400 && motorOutput < 0) motorOutput =  50;
+    
+  }
+
+  controlMotor(motorOutput);
 
   // 定期的にシリアルプロッタなどに状況を確認したい場合
   // Serial.print("Pendulum: "); Serial.print(pendulumAngle);
